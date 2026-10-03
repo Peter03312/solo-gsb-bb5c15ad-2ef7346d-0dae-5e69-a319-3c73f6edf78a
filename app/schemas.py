@@ -40,6 +40,21 @@ class PublishIn(BaseModel):
     base_revision: int = Field(ge=0, description="预演结果中返回的资料修订号")
 
 
+class LockTableIn(BaseModel):
+    """普通分配锁定表 (整表替换): 每篇论文 0~2 名锁定评审人。
+
+    locks 缺省或为空对象表示清除全部锁定; 未列出的论文视为不锁定。
+    提交时校验论文/评审人均存在且不重复, 但被锁评审人是否仍合格
+    (停用/回避/机构冲突/容量) 由预演与发布时的求解器诊断, 提交不拒绝。
+    """
+
+    base_revision: int = Field(ge=0, description="所见到的资料修订号; 与当前不一致即过期")
+    locks: dict[str, List[str]] = Field(
+        default_factory=dict,
+        description="{论文编号: [锁定评审人编号 ...]}, 每篇 0~2 名; 空表清除全部锁定",
+    )
+
+
 class AssignmentDecisionIn(BaseModel):
     paper_id: str = Field(min_length=1, max_length=128, description="当前发布版中分配给本人的论文编号")
     decision: Literal["confirm", "recuse"] = Field(description="confirm=确认接受, recuse=声明回避")

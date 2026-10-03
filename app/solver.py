@@ -332,98 +332,153 @@ def compute_assignment(papers, reviewers, recused_pairs=(), inst_group=None):
     }
 
 
-# ---------------------------------------------------------------- 补位求解
+# ---------------------------------------------------------------- 固定槽位求解
+#
+# 补位 (strict=False) 与普通分配锁定 (strict=True) 共用同一套"固定槽位 + 其余位置
+# 重算"引擎, 仅在固定槽位失效时策略不同:
+#   - 补位: 失效的固定位置释放为可补位置 (fixed_* 诊断), 尽力补齐;
+#   - 锁定: 失效的锁定槽位绝不悄悄释放, 该论文直接标记为不可完整分配
+#           (lock_* 诊断), 发布因此拒绝。
 
-def compute_backfill(papers, reviewers, fixed_map, recused_pairs=(), inst_group=None):
-    """补位预演: 仅面向当前发布版内的论文 (papers 已按该范围过滤)。
+def _compute_fixed_assignment(
+    papers, reviewers, fixed_map, recused_pairs=(), inst_group=None, *, strict=False
+):
+    """固定槽位求解。
 
-    fixed_map:     {paper_id: [reviewer_id, ...]} 当前发布版中"已确认且未回避"
-                   的关系, 这些位置固定不动; 其余位置在原有硬约束与优化次序下重算。
-    recused_pairs: {(reviewer_id, paper_id)} 评审人通过决定接口声明的硬回避
-                   (与会务方录入的 avoid_papers 等价, 但诊断原因单独标注)。
-    inst_group:    机构归并组 {原名: 组键}; 机构冲突一律按归并组判定。
+    fixed_map: {paper_id: [reviewer_id, ...]} 需要固定的槽位 (至多 2 个)。
+    strict=True 时为普通分配锁定: 固定槽位携带的评审人若已删除/停用/回避/
+                 与作者同机构 (含归并), 或被锁两人同机构/均不擅长/累计超容量,
+                 该论文不可完整分配, 锁定槽位不予释放;
+    strict=False 时为补位: 失效固定位置按既有规则释放并标注 fixed_* 原因。
 
-    数据变更导致固定关系失效时 (评审人被删除/与作者变为同机构/硬回避等),
-    该固定位置释放为可补位置, 并在 papers[pid].fixed_problems 中说明。
-    已确认槽位若因机构归并而不再满足"两名评审人不同机构", 同样释放,
-    不得固定该槽位 (fixed_pair_violates_institution_rule_via_merge)。
+    其余位置一律遵守原有全部硬约束与优化次序 (先最小化最高容量比例、
+    再全局字典序最小); 单人固定时仅枚举"包含该固定评审人"的合法对,
+    故专长要求可由另一人满足。
     """
     recused_pairs = set(recused_pairs)
     solver = Solver(papers, reviewers, recused_pairs, inst_group)
     reviewer_by_id = {r.reviewer_id: r for r in solver.reviewers}
     paper_by_id = {p.paper_id: p for p in solver.papers}
 
-    fixed = {}          # pid -> [合法固定评审人 id]
-    fixed_problems = {}  # pid -> [{reviewer_id, reason}]
+    label = "lock" if strict else "fixed"
+    slot_key = "locks" if strict else "fixed"
+    problems_key = "lock_problems" if strict else "fixed_problems"
+
+    def excluded_reason_code(base):
+        # 普通分配的排除原因加 lock_ 前缀, 标明冲突发生在被锁定的槽位上
+        return f"lock_{base}" if strict else base
+
+    fixed = {}             # pid -> [合法固定评审人 id]
+    problems = {}          # pid -> [{reviewer_id, reason}]
+    requested = {}         # pid -> 请求固定的评审人 id 去重序列 (供锁定诊断展示)
+    infeasible = set()     # strict: 锁定槽位失效、不可完整分配的论文
 
     for pid in sorted(fixed_map):
         if pid not in paper_by_id:
-            continue  # 论文已删除: 该发布关系随论文一并消失
+            continue  # 论文已删除: 该关系随论文一并消失 (锁定行已在删除时级联清除)
+        requested[pid] = list(dict.fromkeys(fixed_map[pid]))
         info = solver.info[pid]
-        eligible_ids = {r.reviewer_id for r in info["eligible"]}
         excluded_reason = {e["reviewer_id"]: e["reason"] for e in info["excluded"]}
-        kept, problems = [], []
+        kept, pps = [], []
         seen = set()
         for rid in fixed_map[pid]:
             if rid in seen:
                 continue
             seen.add(rid)
             if rid not in reviewer_by_id:
-                problems.append({"reviewer_id": rid, "reason": "fixed_reviewer_not_found"})
+                pps.append({"reviewer_id": rid, "reason": f"{label}_reviewer_not_found"})
             elif not reviewer_by_id[rid].active:
-                problems.append({"reviewer_id": rid, "reason": "fixed_reviewer_disabled"})
+                pps.append({"reviewer_id": rid, "reason": f"{label}_reviewer_disabled"})
             elif rid in excluded_reason:
-                if (rid, pid) in recused_pairs:
-                    problems.append({"reviewer_id": rid, "reason": "hard_recusal_after_decline"})
-                else:
-                    problems.append({"reviewer_id": rid, "reason": excluded_reason[rid]})
+                pps.append(
+                    {"reviewer_id": rid, "reason": excluded_reason_code(excluded_reason[rid])}
+                )
             else:
                 kept.append(rid)
+        if strict and pps:
+            # 锁定的任一槽位已失格: 双人规则仍需基于保留的锁定者继续检查,
+            # 最后统一标记为不可完整分配 (绝不释放、绝不替换)
+            infeasible.add(pid)
         if len(kept) >= 2:
             a, b = kept[0], kept[1]
             ra, rb = reviewer_by_id[a], reviewer_by_id[b]
             if solver.group_of(ra.institution) == solver.group_of(rb.institution):
-                # 原名不同却同归并组: 失效由机构归并造成, 释放后一槽位且不固定
+                # 原名不同却同归并组: 失效由机构归并造成
                 reason = (
-                    "fixed_pair_violates_institution_rule"
-                    if ra.institution == rb.institution
-                    else "fixed_pair_violates_institution_rule_via_merge"
+                    f"{label}_pair_violates_institution_rule"
+                    + ("" if ra.institution == rb.institution else "_via_merge")
                 )
-                problems.append({"reviewer_id": b, "reason": reason})
+                pps.append({"reviewer_id": b, "reason": reason})
+                # 锁定严格模式: 整篇不可完整分配; 补位释放模式: 释放后一槽位重算
+                if strict:
+                    infeasible.add(pid)
                 kept = [a]
             elif not (is_expert(ra, paper_by_id[pid]) or is_expert(rb, paper_by_id[pid])):
-                problems.append({"reviewer_id": b, "reason": "fixed_pair_violates_expert_rule"})
+                pps.append({"reviewer_id": b, "reason": f"{label}_pair_violates_expert_rule"})
+                if strict:
+                    infeasible.add(pid)
                 kept = [a]
         fixed[pid] = kept
-        if problems:
-            fixed_problems[pid] = problems
+        if pps:
+            problems[pid] = pps
 
-    # 固定位置带来的初始负载; 超过容量时确定性地释放编号最大论文上的多余固定位置
+    if strict:
+        # strict: 任何锁定失效的论文整体退出求解: 锁定清空但论文保留在 fixed 中
+        # (空列表), 使其既不会作为完整锁定对、也不会被当成无锁自由论文重算;
+        # 其锁定负载不计入容量
+        for pid in infeasible:
+            fixed[pid] = []
+
+    # 固定位置带来的初始负载
+    full_caps = {r.reviewer_id: r.capacity for r in solver.reviewers}
     loads = {r.reviewer_id: 0 for r in solver.reviewers}
     for pid in sorted(fixed):
         for rid in fixed[pid]:
             loads[rid] += 1
-    for rid in sorted(loads):
-        cap = reviewer_by_id[rid].capacity
-        if loads[rid] <= cap:
-            continue
-        for pid in sorted(
-            (p for p in fixed if rid in fixed[p]), reverse=True
-        ):
-            if loads[rid] <= cap:
-                break
-            fixed[pid].remove(rid)
-            fixed_problems.setdefault(pid, []).append(
-                {"reviewer_id": rid, "reason": "fixed_assignments_exceed_capacity"}
-            )
-            loads[rid] -= 1
 
-    full_caps = {r.reviewer_id: r.capacity for r in solver.reviewers}
+    if strict:
+        # 锁定累计超过评审人实际容量: 涉及该评审人的全部锁定论文标为不可完整分配,
+        # 绝不释放他人槽位。容量按评审人自身容量判定 (非最小化比例上限)。
+        over = [rid for rid in sorted(loads) if loads[rid] > full_caps[rid]]
+        for rid in over:
+            for pid in sorted(p for p in fixed if rid in fixed[p]):
+                problems.setdefault(pid, []).append(
+                    {"reviewer_id": rid, "reason": f"{label}_assignments_exceed_capacity"}
+                )
+                infeasible.add(pid)
+        for pid in infeasible:
+            fixed[pid] = []
+        loads = {r.reviewer_id: 0 for r in solver.reviewers}
+        for p in fixed:
+            for rid in fixed[p]:
+                loads[rid] += 1
+    else:
+        # 补位: 超过容量时确定性地释放编号最大论文上的多余固定位置
+        for rid in sorted(loads):
+            cap = reviewer_by_id[rid].capacity
+            if loads[rid] <= cap:
+                continue
+            for pid in sorted(
+                (p for p in fixed if rid in fixed[p]), reverse=True
+            ):
+                if loads[rid] <= cap:
+                    break
+                fixed[pid].remove(rid)
+                problems.setdefault(pid, []).append(
+                    {"reviewer_id": rid, "reason": f"{label}_assignments_exceed_capacity"}
+                )
+                loads[rid] -= 1
+
     fixed_pairs = {pid: tuple(ids) for pid, ids in fixed.items() if len(ids) == 2}
-    free_pids = [p.paper_id for p in solver.papers if p.paper_id not in fixed_pairs]
+    free_pids = [
+        p.paper_id
+        for p in solver.papers
+        if p.paper_id not in fixed_pairs and p.paper_id not in infeasible
+    ]
 
     def candidate_pairs(pid):
         required = set(fixed.get(pid, ()))
+        # 单人固定: 仅枚举包含该固定评审人的合法对 (专长可由搭档满足)
         return [pair for pair in solver.info[pid]["pairs"] if required.issubset(pair)]
 
     pairs_of = {pid: candidate_pairs(pid) for pid in free_pids}
@@ -447,7 +502,7 @@ def compute_backfill(papers, reviewers, fixed_map, recused_pairs=(), inst_group=
         return True
 
     def search(caps):
-        """固定位置满足容量上限时, 在剩余位置上求字典序最小完整补位方案。"""
+        """固定位置满足容量上限时, 在剩余位置上求字典序最小完整方案。"""
         cur = dict(loads)
         if any(cur[r] > caps[r] for r in caps):
             return None
@@ -500,7 +555,9 @@ def compute_backfill(papers, reviewers, fixed_map, recused_pairs=(), inst_group=
             }
 
         chosen = search(caps_for(candidates[-1]))
-        if chosen is not None:
+        # 锁定槽位失效的论文不可完整分配: 即便其余自由论文能解, 也必须走
+        # 不可完整分配分支 (绝不悄悄释放锁定), 发布据此拒绝
+        if chosen is not None and not infeasible:
             lo, hi = 0, len(candidates) - 1
             while lo < hi:
                 mid = (lo + hi) // 2
@@ -525,13 +582,13 @@ def compute_backfill(papers, reviewers, fixed_map, recused_pairs=(), inst_group=
                 "max_used_capacity_ratio": str(ratio),
                 "max_used_capacity_ratio_value": float(ratio),
                 "loads": {rid: final_loads[rid] for rid in sorted(final_loads)},
-                "fixed": {pid: list(fixed.get(pid, ())) for pid in sorted(plan)},
-                "fixed_problems": fixed_problems,
-                "papers": _backfill_paper_entries(solver, plan, fixed, fixed_problems, recused_pairs),
+                slot_key: {pid: list(fixed.get(pid, ())) for pid in sorted(plan)},
+                problems_key: problems,
+                "papers": _fixed_paper_entries(solver, plan, fixed, problems, slot_key, problems_key),
                 "diagnostics": {},
             }
 
-    # ---- 无完整补位方案: 最大部分补位 + 诊断 ----
+    # ---- 无完整方案: 最大部分方案 + 诊断 ----
     cur = dict(loads)
     best = {"count": -1, "key": None, "chosen": None}
     n = len(free_pids)
@@ -594,44 +651,99 @@ def compute_backfill(papers, reviewers, fixed_map, recused_pairs=(), inst_group=
         "max_used_capacity_ratio": None,
         "max_used_capacity_ratio_value": None,
         "loads": {rid: final_loads[rid] for rid in sorted(final_loads)},
-        "fixed": {pid: list(fixed.get(pid, ())) for pid in sorted(partial_plan)},
-        "fixed_problems": fixed_problems,
-        "papers": _backfill_paper_entries(
-            solver, partial_plan, fixed, fixed_problems, recused_pairs
+        slot_key: {pid: list(fixed.get(pid, ())) for pid in sorted(partial_plan)},
+        problems_key: problems,
+        "papers": _fixed_paper_entries(
+            solver, partial_plan, fixed, problems, slot_key, problems_key
         ),
-        "diagnostics": _backfill_diagnose(
-            solver, unassigned, final_loads, full_caps, pairs_of, fixed, fixed_problems,
-            recused_pairs,
+        "diagnostics": _fixed_diagnose(
+            solver, unassigned, final_loads, full_caps, pairs_of, fixed, problems,
+            requested, infeasible, slot_key, problems_key, label,
         ),
     }
 
 
-def _backfill_paper_entries(solver, plan, fixed, fixed_problems, recused_pairs):
+def compute_backfill(papers, reviewers, fixed_map, recused_pairs=(), inst_group=None):
+    """补位预演: 仅面向当前发布版内的论文 (papers 已按该范围过滤)。
+
+    fixed_map:     {paper_id: [reviewer_id, ...]} 当前发布版中"已确认且未回避"
+                   的关系, 这些位置固定不动; 其余位置在原有硬约束与优化次序下重算。
+    recused_pairs: {(reviewer_id, paper_id)} 评审人通过决定接口声明的硬回避
+                   (与会务方录入的 avoid_papers 等价, 但诊断原因单独标注)。
+    inst_group:    机构归并组 {原名: 组键}; 机构冲突一律按归并组判定。
+
+    数据变更导致固定关系失效时 (评审人被删除/与作者变为同机构/硬回避等),
+    该固定位置释放为可补位置, 并在 papers[pid].fixed_problems 中说明。
+    已确认槽位若因机构归并而不再满足"两名评审人不同机构", 同样释放,
+    不得固定该槽位 (fixed_pair_violates_institution_rule_via_merge)。
+
+    注意: 补位不读取普通分配锁定表——锁定仅约束普通分配, 不改变补位规则。
+    """
+    return _compute_fixed_assignment(
+        papers, reviewers, fixed_map, recused_pairs, inst_group, strict=False
+    )
+
+
+def compute_locked_assignment(papers, reviewers, lock_map, recused_pairs=(), inst_group=None):
+    """带锁定槽位的普通分配。
+
+    lock_map: {paper_id: [reviewer_id, ...]} 会务方在普通分配前提交的锁定表
+              (每篇 0~2 名评审人; 空表/缺省 = 不锁定)。
+
+    锁定槽位必须保留: 其余位置在机构冲突、主题专长、回避、资格、容量等全部
+    既有硬约束与既有优化次序下重算; 单人锁定时专长可由另一人满足。
+    锁定人随后被删除、停用、回避或因资料/机构归并而失格, 或锁定累计超容量时,
+    锁定槽位绝不悄悄释放: 对应论文在 lock_problems/诊断中给出具体原因并标记为
+    不可完整分配 (feasible=false), 发布据此拒绝且不改变当前发布版。
+    """
+    return _compute_fixed_assignment(
+        papers, reviewers, lock_map, recused_pairs, inst_group, strict=True
+    )
+
+
+def _fixed_paper_entries(solver, plan, fixed, problems, slot_key, problems_key):
     out = {}
     for pid in sorted(plan):
         out[pid] = {
             "assigned": list(plan[pid]),
-            "fixed": list(fixed.get(pid, ())),
+            slot_key: list(fixed.get(pid, ())),
             "eligible_reviewers": [r.reviewer_id for r in solver.info[pid]["eligible"]],
             "excluded": [dict(e) for e in solver.info[pid]["excluded"]],
-            "fixed_problems": fixed_problems.get(pid, []),
+            problems_key: problems.get(pid, []),
         }
     return out
 
 
-def _backfill_diagnose(solver, unassigned_ids, loads, caps, pairs_of, fixed,
-                       fixed_problems, recused_pairs):
+def _fixed_diagnose(solver, unassigned_ids, loads, caps, pairs_of, fixed, problems,
+                    requested, infeasible, slot_key, problems_key, label):
     paper_by_id = {p.paper_id: p for p in solver.papers}
     out = {}
     for pid in unassigned_ids:
         paper = paper_by_id[pid]
         info = solver.info[pid]
         eligible = info["eligible"]
+        pps = problems.get(pid, [])
+        entry = {
+            "eligible_reviewers": [r.reviewer_id for r in eligible],
+            "eligible_at_capacity": [
+                r.reviewer_id
+                for r in eligible
+                if loads[r.reviewer_id] >= caps[r.reviewer_id]
+            ],
+            "excluded": [dict(e) for e in info["excluded"]],
+            slot_key: list(requested.get(pid, fixed.get(pid, ()))),
+            problems_key: pps,
+        }
+        if pid in infeasible:
+            # 锁定槽位失效: 具体冲突即限制原因, 不释放锁定、不做替换尝试
+            entry["reasons"] = list(dict.fromkeys(p["reason"] for p in pps))
+            out[pid] = entry
+            continue
         pairs = pairs_of.get(pid, [])
         reasons = []
         if len(eligible) < 2:
             reasons.append("fewer_than_two_eligible_reviewers")
-        full = [r.reviewer_id for r in eligible if loads[r.reviewer_id] >= caps[r.reviewer_id]]
+        full = entry["eligible_at_capacity"]
         if eligible and len(eligible) - len(full) < 2:
             reasons.append("eligible_reviewers_at_capacity")
         if not any(is_expert(r, paper) for r in eligible):
@@ -643,20 +755,14 @@ def _backfill_diagnose(solver, unassigned_ids, loads, caps, pairs_of, fixed,
                 reasons.append("eligible_reviewers_share_single_institution_via_merge")
         if fixed.get(pid):
             if not pairs:
-                reasons.append("no_valid_pair_containing_fixed_reviewer")
+                reasons.append(f"no_valid_pair_containing_{label}_reviewer")
             elif not any(loads[a] < caps[a] and loads[b] < caps[b] for a, b in pairs):
-                reasons.append("all_fixed_compatible_pairs_blocked_by_capacity")
+                reasons.append(f"all_{label}_compatible_pairs_blocked_by_capacity")
         else:
             if not info["pairs"]:
                 reasons.append("no_valid_reviewer_pair")
             elif not any(loads[a] < caps[a] and loads[b] < caps[b] for a, b in info["pairs"]):
                 reasons.append("all_valid_pairs_blocked_by_capacity")
-        out[pid] = {
-            "eligible_reviewers": [r.reviewer_id for r in eligible],
-            "eligible_at_capacity": full,
-            "excluded": [dict(e) for e in info["excluded"]],
-            "fixed": list(fixed.get(pid, ())),
-            "fixed_problems": fixed_problems.get(pid, []),
-            "reasons": reasons,
-        }
+        entry["reasons"] = reasons
+        out[pid] = entry
     return out
