@@ -1,7 +1,7 @@
 """请求体模型与校验规则 (非法容量等在此明确报错)。"""
 from __future__ import annotations
 
-from typing import List, Literal, Optional
+from typing import Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, StrictInt
 
@@ -88,3 +88,11 @@ class ReviewCorrectionSubmitIn(BaseModel):
     original_receipt: str = Field(min_length=1, max_length=128, description="被更正评语的收据")
     score: StrictInt = Field(ge=1, le=5, description="更正后的 1~5 整数评分")
     comment: str = Field(min_length=1, max_length=10000, description="更正后的非空评语")
+
+
+class LockTableIn(BaseModel):
+    base_revision: int = Field(ge=0, description="所见到的资料修订号; 与当前不一致即过期")
+    locks: Dict[str, List[str]] = Field(
+        default_factory=dict,
+        description="完整锁定表 {论文编号: [评审人编号, ...]}; 每篇 0~2 名; 空表表示清除全部锁定",
+    )

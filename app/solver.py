@@ -277,12 +277,162 @@ def _loads_of(plan):
     return loads
 
 
-def compute_assignment(papers, reviewers, recused_pairs=(), inst_group=None):
+# ------------------------------------------------ 固定位置求解 (补位与锁定表共用)
+#
+# 以下辅助函数在"部分槽位已被固定"的前提下求解: fixed = {paper_id: [reviewer_id]}
+# (每篇 0~2 名, 固定成员资格/容量已由调用方校验), 剩余位置遵守既有硬约束,
+# 优化次序与无固定位置时一致 (先最小化最高已用容量比例, 再全局字典序最小)。
+
+def _rest_ok_slots(free_pids, pairs_of, fixed, cur, caps, i):
+    """从第 i 篇自由论文起, 剩余位置是否仍可能全部补齐 (必要条件的快速剪枝)。"""
+    needed_slots = sum(2 - len(fixed.get(pid, ())) for pid in free_pids[i:])
+    remaining = sum(caps[r] - cur[r] for r in caps)
+    if remaining < needed_slots:
+        return False
+    for pid in free_pids[i:]:
+        required = set(fixed.get(pid, ()))
+        if required:
+            # 固定成员已预占负载且校验过容量, 只需存在一名有余量的搭档
+            (rid,) = tuple(required)
+            partners = {a if b == rid else b for a, b in pairs_of[pid]}
+            if not any(cur[other] < caps[other] for other in partners):
+                return False
+        elif not any(cur[a] < caps[a] and cur[b] < caps[b] for a, b in pairs_of[pid]):
+            return False
+    return True
+
+
+def _search_complete(free_pids, pairs_of, fixed, base_loads, caps):
+    """固定位置满足容量上限 caps 时, 在剩余位置上求字典序最小的完整方案; 不可行返回 None。"""
+    cur = dict(base_loads)
+    if any(cur[r] > caps[r] for r in caps):
+        return None
+    chosen = {}
+
+    def backtrack(i):
+        if i == len(free_pids):
+            return True
+        pid = free_pids[i]
+        required = set(fixed.get(pid, ()))
+        for a, b in pairs_of[pid]:
+            # 固定成员的占用已预载在 cur 中, 只需其当前负载不超上限;
+            # 新占用容量的自由成员才检查余量
+            free_a, free_b = a not in required, b not in required
+            ok_a = (cur[a] < caps[a]) if free_a else (cur[a] <= caps[a])
+            ok_b = (cur[b] < caps[b]) if free_b else (cur[b] <= caps[b])
+            if ok_a and ok_b:
+                if free_a:
+                    cur[a] += 1
+                if free_b:
+                    cur[b] += 1
+                chosen[pid] = (a, b)
+                if _rest_ok_slots(free_pids, pairs_of, fixed, cur, caps, i + 1) and backtrack(i + 1):
+                    return True
+                del chosen[pid]
+                if free_a:
+                    cur[a] -= 1
+                if free_b:
+                    cur[b] -= 1
+        return False
+
+    if _rest_ok_slots(free_pids, pairs_of, fixed, cur, caps, 0) and backtrack(0):
+        return chosen
+    return None
+
+
+def _min_ratio_complete(solver, free_pids, pairs_of, fixed, base_loads):
+    """最小化最高已用容量比例 (含固定负载), 返回该上限下字典序最小的完整方案; 不可行返回 None。"""
+    if not solver.reviewers:
+        return None
+    candidates = sorted({
+        Fraction(k, r.capacity)
+        for r in solver.reviewers
+        for k in range(1, r.capacity + 1)
+    })
+
+    def caps_for(t):
+        return {
+            r.reviewer_id: (t * r.capacity).numerator // (t * r.capacity).denominator
+            for r in solver.reviewers
+        }
+
+    if _search_complete(free_pids, pairs_of, fixed, base_loads, caps_for(candidates[-1])) is None:
+        return None
+    lo, hi = 0, len(candidates) - 1
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if _search_complete(free_pids, pairs_of, fixed, base_loads, caps_for(candidates[mid])) is not None:
+            hi = mid
+        else:
+            lo = mid + 1
+    return _search_complete(free_pids, pairs_of, fixed, base_loads, caps_for(candidates[lo]))
+
+
+def _search_partial(free_pids, pairs_of, fixed, base_loads, caps):
+    """最多论文被完整分配的部分方案 (并列时按全局序列字典序最小)。返回 {pid: (a, b)}。"""
+    cur = dict(base_loads)
+    best = {"count": -1, "key": None, "chosen": None}
+    n = len(free_pids)
+    chosen_partial = {}
+
+    def key_of(chosen):
+        seq = []
+        for pid in free_pids:
+            if pid in chosen:
+                seq.append((0,) + chosen[pid])
+            else:
+                seq.append((1, "", ""))
+        return tuple(seq)
+
+    def backtrack(i, count):
+        if best["count"] > count + (n - i):
+            return  # 已不可能取得更多分配
+        if i == n:
+            k = key_of(chosen_partial)
+            if count > best["count"] or (
+                count == best["count"] and (best["key"] is None or k < best["key"])
+            ):
+                best["count"] = count
+                best["key"] = k
+                best["chosen"] = dict(chosen_partial)
+            return
+        pid = free_pids[i]
+        required = set(fixed.get(pid, ()))
+        for a, b in pairs_of[pid]:
+            free_a, free_b = a not in required, b not in required
+            ok_a = (cur[a] < caps[a]) if free_a else (cur[a] <= caps[a])
+            ok_b = (cur[b] < caps[b]) if free_b else (cur[b] <= caps[b])
+            if ok_a and ok_b:
+                if free_a:
+                    cur[a] += 1
+                if free_b:
+                    cur[b] += 1
+                chosen_partial[pid] = (a, b)
+                backtrack(i + 1, count + 1)
+                del chosen_partial[pid]
+                if free_a:
+                    cur[a] -= 1
+                if free_b:
+                    cur[b] -= 1
+        backtrack(i + 1, count)  # 跳过该论文
+
+    backtrack(0, 0)
+    return best["chosen"] or {}
+
+
+def compute_assignment(papers, reviewers, recused_pairs=(), inst_group=None, locks=None):
     """求解入口。返回可 JSON 序列化的结果字典。
 
     inst_group: 机构归并组 {原名: 组键}; 机构冲突一律按归并组判定。
+    locks:      可选的会务方锁定表 {paper_id: [reviewer_id, ...]} (每篇 0~2 名,
+                仅约束普通分配, 不影响补位)。合法锁定槽位在方案中原样保留;
+                锁定人随后被删除/停用/回避或因资料与机构归并而失格时,
+                不悄悄释放锁定: 结果标为不可完整分配 (feasible=false),
+                并在 lock_problems 与 diagnostics 中说明具体冲突。
     """
     solver = Solver(papers, reviewers, recused_pairs, inst_group)
+    if locks:
+        return _compute_locked_assignment(solver, locks)
     reviewer_by_id = {r.reviewer_id: r for r in solver.reviewers}
     explanations = {
         pid: {
@@ -312,6 +462,8 @@ def compute_assignment(papers, reviewers, recused_pairs=(), inst_group=None):
             "max_used_capacity_ratio": str(ratio),
             "max_used_capacity_ratio_value": float(ratio),
             "loads": {rid: loads.get(rid, 0) for rid in sorted(reviewer_by_id)},
+            "locks": {},
+            "lock_problems": {},
             "papers": paper_entries(plan),
             "diagnostics": {},
         }
@@ -327,9 +479,236 @@ def compute_assignment(papers, reviewers, recused_pairs=(), inst_group=None):
         "max_used_capacity_ratio": None,
         "max_used_capacity_ratio_value": None,
         "loads": {rid: loads.get(rid, 0) for rid in sorted(reviewer_by_id)},
+        "locks": {},
+        "lock_problems": {},
         "papers": paper_entries(partial),
         "diagnostics": solver.diagnose(unassigned, loads, full_caps),
     }
+
+
+# ------------------------------------------------ 带锁定表的普通分配
+
+# 锁定人失格时, 普通排除原因 -> 锁定冲突原因 (不悄悄释放锁定, 预演说明具体冲突)
+_LOCKED_EXCLUDED_REASONS = {
+    "same_institution_as_author": "locked_reviewer_same_institution_as_author",
+    "same_institution_as_author_via_merge": "locked_reviewer_same_institution_as_author_via_merge",
+    "on_reviewer_avoid_list": "locked_reviewer_on_avoid_list",
+    "hard_recusal_after_decline": "locked_reviewer_hard_recusal",
+}
+
+
+def _compute_locked_assignment(solver, locks):
+    """带会务方锁定表的普通分配求解 (locks 仅约束普通分配, 不影响补位)。
+
+    合法锁定槽位在方案中原样保留, 剩余位置遵守全部既有硬约束与优化次序
+    (先最小化最高容量比例, 再全局字典序最小; 单人锁定时专长要求可由搭档满足)。
+    任何无法兑现的锁定 (锁定人被删除/停用/回避/失格、锁定对同机构或无专长、
+    锁定累计超容量) 都不被悄悄释放: 对应论文不可完整分配, 结果 feasible=false,
+    lock_problems 与 diagnostics 逐条说明具体冲突。
+    """
+    reviewer_by_id = {r.reviewer_id: r for r in solver.reviewers}
+    paper_by_id = {p.paper_id: p for p in solver.papers}
+
+    # ---- 校验锁定, 拆分 合法锁定 / 无法兑现的锁定 ----
+    lock_problems = {}  # pid -> [{"reviewer_id": rid, "reason": ...}]
+    fixed = {}          # pid -> [合法锁定评审人 id] (按编号升序)
+    for pid in sorted(locks):
+        if pid not in paper_by_id:
+            continue  # 论文已删除: 锁定无可约束对象, 不参与求解 (锁定表行保留, 会务方可查看/清除)
+        ids = sorted(set(locks[pid]))
+        if not ids:
+            continue
+        info = solver.info[pid]
+        excluded_reason = {e["reviewer_id"]: e["reason"] for e in info["excluded"]}
+        kept, problems = [], []
+        for rid in ids:
+            if rid not in reviewer_by_id:
+                problems.append({"reviewer_id": rid, "reason": "locked_reviewer_not_found"})
+            elif not reviewer_by_id[rid].active:
+                problems.append({"reviewer_id": rid, "reason": "locked_reviewer_disabled"})
+            elif rid in excluded_reason:
+                problems.append(
+                    {"reviewer_id": rid, "reason": _LOCKED_EXCLUDED_REASONS[excluded_reason[rid]]}
+                )
+            else:
+                kept.append(rid)
+        if not problems and len(kept) == 2:
+            a, b = kept
+            ra, rb = reviewer_by_id[a], reviewer_by_id[b]
+            if solver.group_of(ra.institution) == solver.group_of(rb.institution):
+                # 原名不同却同归并组: 失格由机构归并造成
+                reason = (
+                    "locked_pair_same_institution"
+                    if ra.institution == rb.institution
+                    else "locked_pair_same_institution_via_merge"
+                )
+                problems.append({"reviewer_id": b, "reason": reason})
+            elif not (is_expert(ra, paper_by_id[pid]) or is_expert(rb, paper_by_id[pid])):
+                problems.append({"reviewer_id": b, "reason": "locked_pair_no_expert"})
+        if problems:
+            lock_problems[pid] = problems
+        else:
+            fixed[pid] = kept
+
+    # 锁定自身累计超容量: 不释放, 确定性地在编号最大的论文上标记冲突
+    for rid in sorted(reviewer_by_id):
+        cap = reviewer_by_id[rid].capacity
+        load = sum(1 for p in fixed if rid in fixed[p])
+        if load <= cap:
+            continue
+        for pid in sorted((p for p in fixed if rid in fixed[p]), reverse=True):
+            if load <= cap:
+                break
+            lock_problems.setdefault(pid, []).append(
+                {"reviewer_id": rid, "reason": "locked_assignments_exceed_capacity"}
+            )
+            del fixed[pid]
+            load -= 1
+
+    # ---- 合法锁定作为固定位置, 在剩余位置上按既有约束与优化次序求解 ----
+    base_loads = {rid: 0 for rid in reviewer_by_id}
+    for ids in fixed.values():
+        for rid in ids:
+            base_loads[rid] += 1
+    full_caps = {r.reviewer_id: r.capacity for r in solver.reviewers}
+    fixed_pairs = {pid: tuple(ids) for pid, ids in fixed.items() if len(ids) == 2}
+    free_pids = [
+        p.paper_id for p in solver.papers
+        if p.paper_id not in fixed_pairs and p.paper_id not in lock_problems
+    ]
+
+    def candidate_pairs(pid):
+        required = set(fixed.get(pid, ()))
+        if not required:
+            return solver.info[pid]["pairs"]
+        return [pair for pair in solver.info[pid]["pairs"] if required.issubset(pair)]
+
+    pairs_of = {pid: candidate_pairs(pid) for pid in free_pids}
+    honored = {pid: list(ids) for pid, ids in sorted(fixed.items())}
+    explanations = {
+        pid: {
+            "eligible_reviewers": [r.reviewer_id for r in info["eligible"]],
+            "excluded": info["excluded"],
+        }
+        for pid, info in solver.info.items()
+    }
+
+    def paper_entries(plan):
+        return {
+            pid: {"assigned": list(plan[pid]), "locked": list(fixed.get(pid, ())), **explanations[pid]}
+            for pid in sorted(plan)
+        }
+
+    plan = dict(fixed_pairs)
+    chosen = _min_ratio_complete(solver, free_pids, pairs_of, fixed, base_loads)
+    if chosen is not None and not lock_problems:
+        plan.update(chosen)
+        loads = _loads_of(plan)
+        ratio = Fraction(0)
+        for r in solver.reviewers:
+            ratio = max(ratio, Fraction(loads.get(r.reviewer_id, 0), r.capacity))
+        return {
+            "feasible": True,
+            "plan": {pid: list(pair) for pid, pair in sorted(plan.items())},
+            "unassigned": [],
+            "max_used_capacity_ratio": str(ratio),
+            "max_used_capacity_ratio_value": float(ratio),
+            "loads": {rid: loads.get(rid, 0) for rid in sorted(reviewer_by_id)},
+            "locks": honored,
+            "lock_problems": {},
+            "papers": paper_entries(plan),
+            "diagnostics": {},
+        }
+
+    # ---- 不可完整分配: 合法锁定照常兑现, 其余论文给最大部分方案; 问题锁定逐条说明 ----
+    if chosen is None:
+        chosen = _search_partial(free_pids, pairs_of, fixed, base_loads, full_caps)
+    plan.update(chosen)
+    loads = _loads_of(plan)
+    unassigned = [p.paper_id for p in solver.papers if p.paper_id not in plan]
+    diagnostics = {}
+    for pid in sorted(lock_problems):
+        info = solver.info[pid]
+        diagnostics[pid] = {
+            "eligible_reviewers": [r.reviewer_id for r in info["eligible"]],
+            "eligible_at_capacity": [
+                r.reviewer_id for r in info["eligible"]
+                if loads.get(r.reviewer_id, 0) >= full_caps[r.reviewer_id]
+            ],
+            "excluded": [dict(e) for e in info["excluded"]],
+            "locked": sorted(set(locks[pid])),
+            "lock_problems": lock_problems[pid],
+            "reasons": [p["reason"] for p in lock_problems[pid]],
+        }
+    diagnostics.update(
+        _locked_diagnose(
+            solver,
+            [pid for pid in unassigned if pid not in lock_problems],
+            loads, full_caps, pairs_of, fixed,
+        )
+    )
+    return {
+        "feasible": False,
+        "plan": {pid: list(pair) for pid, pair in sorted(plan.items())},
+        "unassigned": unassigned,
+        "max_used_capacity_ratio": None,
+        "max_used_capacity_ratio_value": None,
+        "loads": {rid: loads.get(rid, 0) for rid in sorted(reviewer_by_id)},
+        "locks": honored,
+        "lock_problems": lock_problems,
+        "papers": paper_entries(plan),
+        "diagnostics": {pid: diagnostics[pid] for pid in sorted(diagnostics)},
+    }
+
+
+def _locked_diagnose(solver, unassigned_ids, loads, caps, pairs_of, fixed):
+    """带锁定求解中, 对非锁定问题导致的未分配论文给出限制原因。"""
+    paper_by_id = {p.paper_id: p for p in solver.papers}
+    out = {}
+    for pid in unassigned_ids:
+        paper = paper_by_id[pid]
+        info = solver.info[pid]
+        eligible = info["eligible"]
+        pairs = pairs_of.get(pid, [])
+        reasons = []
+        if len(eligible) < 2:
+            reasons.append("fewer_than_two_eligible_reviewers")
+        full = [
+            r.reviewer_id for r in eligible
+            if loads.get(r.reviewer_id, 0) >= caps[r.reviewer_id]
+        ]
+        if eligible and len(eligible) - len(full) < 2:
+            reasons.append("eligible_reviewers_at_capacity")
+        if not any(is_expert(r, paper) for r in eligible):
+            reasons.append("no_expert_among_eligible_reviewers")
+        if len(eligible) >= 2 and len({solver.group_of(r.institution) for r in eligible}) < 2:
+            if len({r.institution for r in eligible}) < 2:
+                reasons.append("eligible_reviewers_share_single_institution")
+            else:
+                reasons.append("eligible_reviewers_share_single_institution_via_merge")
+        if fixed.get(pid):
+            if not pairs:
+                reasons.append("no_valid_pair_containing_locked_reviewer")
+            elif not any(
+                loads.get(a, 0) < caps[a] and loads.get(b, 0) < caps[b] for a, b in pairs
+            ):
+                reasons.append("all_locked_compatible_pairs_blocked_by_capacity")
+        else:
+            if not info["pairs"]:
+                reasons.append("no_valid_reviewer_pair")
+            elif not any(
+                loads.get(a, 0) < caps[a] and loads.get(b, 0) < caps[b] for a, b in info["pairs"]
+            ):
+                reasons.append("all_valid_pairs_blocked_by_capacity")
+        out[pid] = {
+            "eligible_reviewers": [r.reviewer_id for r in eligible],
+            "eligible_at_capacity": full,
+            "excluded": [dict(e) for e in info["excluded"]],
+            "locked": list(fixed.get(pid, ())),
+            "lock_problems": [],
+            "reasons": reasons,
+        }
+    return out
 
 
 # ---------------------------------------------------------------- 补位求解
@@ -427,161 +806,36 @@ def compute_backfill(papers, reviewers, fixed_map, recused_pairs=(), inst_group=
         return [pair for pair in solver.info[pid]["pairs"] if required.issubset(pair)]
 
     pairs_of = {pid: candidate_pairs(pid) for pid in free_pids}
-
-    def rest_ok(cur_loads, i, caps):
-        # 剩余自由槽位需求: 每个自由论文 2 个位置, 单固定论文的固定成员已由预占负载覆盖
-        needed_slots = sum(2 - len(fixed.get(pid, ())) for pid in free_pids[i:])
-        remaining = sum(caps[r] - cur_loads[r] for r in caps)
-        if remaining < needed_slots:
-            return False
-        for pid in free_pids[i:]:
-            required = set(fixed.get(pid, ()))
-            if required:
-                # 固定成员已预占负载且校验过容量, 只需存在一名有余量的搭档
-                (rid,) = tuple(required)
-                partners = {a if b == rid else b for a, b in pairs_of[pid]}
-                if not any(cur_loads[other] < caps[other] for other in partners):
-                    return False
-            elif not any(cur_loads[a] < caps[a] and cur_loads[b] < caps[b] for a, b in pairs_of[pid]):
-                return False
-        return True
-
-    def search(caps):
-        """固定位置满足容量上限时, 在剩余位置上求字典序最小完整补位方案。"""
-        cur = dict(loads)
-        if any(cur[r] > caps[r] for r in caps):
-            return None
-        chosen = {}
-
-        def backtrack(i):
-            if i == len(free_pids):
-                return True
-            pid = free_pids[i]
-            required = set(fixed.get(pid, ()))
-            for a, b in pairs_of[pid]:
-                # 固定成员的占用已预载在 cur 中, 只需其当前负载不超上限;
-                # 新占用容量的自由成员才检查余量
-                free_a, free_b = a not in required, b not in required
-                ok_a = (cur[a] < caps[a]) if free_a else (cur[a] <= caps[a])
-                ok_b = (cur[b] < caps[b]) if free_b else (cur[b] <= caps[b])
-                if ok_a and ok_b:
-                    if free_a:
-                        cur[a] += 1
-                    if free_b:
-                        cur[b] += 1
-                    chosen[pid] = (a, b)
-                    if rest_ok(cur, i + 1, caps) and backtrack(i + 1):
-                        return True
-                    del chosen[pid]
-                    if free_a:
-                        cur[a] -= 1
-                    if free_b:
-                        cur[b] -= 1
-            return False
-
-        if rest_ok(cur, 0, caps) and backtrack(0):
-            return chosen
-        return None
-
     plan = dict(fixed_pairs)
 
     # ---- 最小化最高已用容量比例 (含固定负载) ----
-    if solver.reviewers:
-        candidates = sorted({
-            Fraction(k, r.capacity)
-            for r in solver.reviewers
-            for k in range(1, r.capacity + 1)
-        })
-
-        def caps_for(t):
-            return {
-                r.reviewer_id: (t * r.capacity).numerator // (t * r.capacity).denominator
-                for r in solver.reviewers
-            }
-
-        chosen = search(caps_for(candidates[-1]))
-        if chosen is not None:
-            lo, hi = 0, len(candidates) - 1
-            while lo < hi:
-                mid = (lo + hi) // 2
-                if search(caps_for(candidates[mid])) is not None:
-                    hi = mid
-                else:
-                    lo = mid + 1
-            chosen = search(caps_for(candidates[lo]))
-            plan.update(chosen)
-            final_loads = {rid: 0 for rid in full_caps}
-            for a, b in plan.values():
-                final_loads[a] += 1
-                final_loads[b] += 1
-            ratio = max(
-                (Fraction(final_loads[r.reviewer_id], r.capacity) for r in solver.reviewers),
-                default=Fraction(0),
-            )
-            return {
-                "feasible": True,
-                "plan": {pid: list(plan[pid]) for pid in sorted(plan)},
-                "unassigned": [],
-                "max_used_capacity_ratio": str(ratio),
-                "max_used_capacity_ratio_value": float(ratio),
-                "loads": {rid: final_loads[rid] for rid in sorted(final_loads)},
-                "fixed": {pid: list(fixed.get(pid, ())) for pid in sorted(plan)},
-                "fixed_problems": fixed_problems,
-                "papers": _backfill_paper_entries(solver, plan, fixed, fixed_problems, recused_pairs),
-                "diagnostics": {},
-            }
+    chosen = _min_ratio_complete(solver, free_pids, pairs_of, fixed, loads)
+    if chosen is not None:
+        plan.update(chosen)
+        final_loads = {rid: 0 for rid in full_caps}
+        for a, b in plan.values():
+            final_loads[a] += 1
+            final_loads[b] += 1
+        ratio = max(
+            (Fraction(final_loads[r.reviewer_id], r.capacity) for r in solver.reviewers),
+            default=Fraction(0),
+        )
+        return {
+            "feasible": True,
+            "plan": {pid: list(plan[pid]) for pid in sorted(plan)},
+            "unassigned": [],
+            "max_used_capacity_ratio": str(ratio),
+            "max_used_capacity_ratio_value": float(ratio),
+            "loads": {rid: final_loads[rid] for rid in sorted(final_loads)},
+            "fixed": {pid: list(fixed.get(pid, ())) for pid in sorted(plan)},
+            "fixed_problems": fixed_problems,
+            "papers": _backfill_paper_entries(solver, plan, fixed, fixed_problems, recused_pairs),
+            "diagnostics": {},
+        }
 
     # ---- 无完整补位方案: 最大部分补位 + 诊断 ----
-    cur = dict(loads)
-    best = {"count": -1, "key": None, "chosen": None}
-    n = len(free_pids)
-    chosen_partial = {}
-
-    def key_of(chosen):
-        seq = []
-        for pid in free_pids:
-            if pid in chosen:
-                seq.append((0,) + chosen[pid])
-            else:
-                seq.append((1, "", ""))
-        return tuple(seq)
-
-    def backtrack_partial(i, count):
-        if best["count"] > count + (n - i):
-            return
-        if i == n:
-            k = key_of(chosen_partial)
-            if count > best["count"] or (
-                count == best["count"] and (best["key"] is None or k < best["key"])
-            ):
-                best["count"] = count
-                best["key"] = k
-                best["chosen"] = dict(chosen_partial)
-            return
-        pid = free_pids[i]
-        required = set(fixed.get(pid, ()))
-        for a, b in pairs_of[pid]:
-            free_a, free_b = a not in required, b not in required
-            ok_a = (cur[a] < full_caps[a]) if free_a else (cur[a] <= full_caps[a])
-            ok_b = (cur[b] < full_caps[b]) if free_b else (cur[b] <= full_caps[b])
-            if ok_a and ok_b:
-                if free_a:
-                    cur[a] += 1
-                if free_b:
-                    cur[b] += 1
-                chosen_partial[pid] = (a, b)
-                backtrack_partial(i + 1, count + 1)
-                del chosen_partial[pid]
-                if free_a:
-                    cur[a] -= 1
-                if free_b:
-                    cur[b] -= 1
-        backtrack_partial(i + 1, count)
-
-    backtrack_partial(0, 0)
     partial_plan = dict(fixed_pairs)
-    if best["chosen"]:
-        partial_plan.update(best["chosen"])
+    partial_plan.update(_search_partial(free_pids, pairs_of, fixed, loads, full_caps))
     final_loads = {rid: 0 for rid in full_caps}
     for a, b in partial_plan.values():
         final_loads[a] += 1

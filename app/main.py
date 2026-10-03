@@ -21,6 +21,7 @@ from .schemas import (
     AssignmentDecisionIn,
     BackfillPublishIn,
     InstitutionMergeIn,
+    LockTableIn,
     PaperIn,
     PaperUpdate,
     PublishIn,
@@ -644,17 +645,109 @@ def list_institution_merge_groups(_: bool = Depends(require_organizer)):
     return {"revision": rev, "groups": groups}
 
 
+# ------------------------------------------------ 普通分配锁定表 (会务方)
+
+@app.put("/assignment/locks")
+def put_assignment_locks(body: LockTableIn, _: bool = Depends(require_organizer)):
+    """会务方在普通分配前提交完整的锁定表 (每篇论文锁定 0~2 名评审人)。
+
+    - 请求在同一个写事务内先核对资料修订号: 过期/超前 409;
+      未知论文/未知评审人 404; 同一论文重复锁定同一评审人 422;
+      每篇锁定超过 2 名 422; 被拒请求一律不改动当前锁定表、不推进修订号;
+    - 空表 ({}) 表示清除全部锁定;
+    - 相同锁定表的重试幂等 (changed=false), 不推进资料修订号;
+    - 有效变更整体替换锁定表并推进资料修订号 +1, 响应返回修订号与是否变更;
+    - 锁定仅约束普通分配 (预演/发布必须保留锁定槽位), 不改变补位的确认槽位规则;
+      锁定人随后失格时不悄悄释放锁定 (见预演的 lock_problems)。
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    with db.write_txn() as conn:
+        rev = db.get_revision(conn)
+        if body.base_revision != rev:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"资料已变更: 锁定表基于修订号 {body.base_revision}, "
+                    f"当前修订号为 {rev}, 请重新查看资料后再提交"
+                ),
+            )
+        submitted = {pid: list(rids) for pid, rids in body.locks.items()}
+        unknown_papers = sorted(
+            pid for pid in submitted
+            if not conn.execute("SELECT 1 FROM papers WHERE paper_id = ?", (pid,)).fetchone()
+        )
+        if unknown_papers:
+            raise HTTPException(
+                status_code=404,
+                detail="锁定表包含未知论文, 未改动当前锁定: " + ", ".join(unknown_papers),
+            )
+        all_rids = sorted({rid for rids in submitted.values() for rid in rids})
+        unknown_reviewers = [
+            rid for rid in all_rids
+            if not conn.execute("SELECT 1 FROM reviewers WHERE reviewer_id = ?", (rid,)).fetchone()
+        ]
+        if unknown_reviewers:
+            raise HTTPException(
+                status_code=404,
+                detail="锁定表包含未知评审人, 未改动当前锁定: " + ", ".join(unknown_reviewers),
+            )
+        duplicates = sorted(
+            pid for pid, rids in submitted.items() if len(set(rids)) != len(rids)
+        )
+        if duplicates:
+            raise HTTPException(
+                status_code=422,
+                detail="同一论文重复锁定同一评审人, 未改动当前锁定: " + ", ".join(duplicates),
+            )
+        oversized = sorted(pid for pid, rids in submitted.items() if len(rids) > 2)
+        if oversized:
+            raise HTTPException(
+                status_code=422,
+                detail="每篇论文至多锁定 2 名评审人, 未改动当前锁定: " + ", ".join(oversized),
+            )
+        # 规范化: 去掉空列表项, 每篇的评审人按编号升序, 与当前表比较
+        new_locks = {pid: sorted(rids) for pid, rids in submitted.items() if rids}
+        current = db.get_assignment_locks(conn)
+        if new_locks == current:
+            # 相同锁定表重试: 幂等, 不写行、不推进修订号
+            return {"ok": True, "changed": False, "revision": rev, "locks": current}
+        conn.execute("DELETE FROM assignment_locks")
+        for pid, rids in new_locks.items():
+            for rid in rids:
+                conn.execute(
+                    "INSERT INTO assignment_locks(paper_id, reviewer_id, revision, locked_at)"
+                    " VALUES (?,?,?,?)",
+                    (pid, rid, rev + 1, now),
+                )
+        new_rev = db.bump_revision(conn)
+    return {"ok": True, "changed": True, "revision": new_rev, "locks": new_locks}
+
+
+@app.get("/assignment/locks")
+def get_assignment_locks(_: bool = Depends(require_organizer)):
+    """会务方查看当前普通分配锁定表 (仅约束普通分配, 不影响补位)。"""
+    with db.read_txn() as conn:
+        rev = db.get_revision(conn)
+        locks = db.get_assignment_locks(conn)
+    return {"revision": rev, "locks": locks}
+
+
 # ---------------------------------------------------------------- 预演 / 发布 (会务方)
 
 @app.post("/assignment/dry-run")
 def dry_run(_: bool = Depends(require_organizer)):
-    """基于当前资料试算分配方案; 不改动已发布版本。返回所依据的资料修订号。"""
+    """基于当前资料与锁定表试算分配方案; 不改动已发布版本。返回所依据的资料修订号。
+
+    合法锁定槽位在方案中原样保留 (locks); 无法兑现的锁定不被悄悄释放:
+    结果标为不可完整分配 (feasible=false), 并在 lock_problems 与诊断中说明具体冲突。
+    """
     with db.read_txn() as conn:
         rev = db.get_revision(conn)
         papers, reviewers = _load_domain(conn)
         recused = _recused_pairs(conn)
         groups = _institution_groups(conn)
-    result = compute_assignment(papers, reviewers, recused, groups)
+        locks = db.get_assignment_locks(conn)
+    result = compute_assignment(papers, reviewers, recused, groups, locks=locks)
     result["revision"] = rev
     return result
 
@@ -665,6 +758,8 @@ def publish(body: PublishIn, _: bool = Depends(require_organizer)):
 
     校验修订号、重算方案、写入发布版在同一个写事务内完成,
     与资料修改并发时不会产生基于旧版资料的方案。
+    方案必须保留全部合法锁定槽位; 存在无法兑现的锁定时视同无可行方案 (422),
+    当前发布版保持不变。
     """
     with db.write_txn() as conn:
         rev = db.get_revision(conn)
@@ -678,7 +773,8 @@ def publish(body: PublishIn, _: bool = Depends(require_organizer)):
             )
         papers, reviewers = _load_domain(conn)
         result = compute_assignment(
-            papers, reviewers, _recused_pairs(conn), _institution_groups(conn)
+            papers, reviewers, _recused_pairs(conn), _institution_groups(conn),
+            locks=db.get_assignment_locks(conn),
         )
         if not result["feasible"]:
             raise HTTPException(
@@ -687,6 +783,7 @@ def publish(body: PublishIn, _: bool = Depends(require_organizer)):
                     "message": "当前资料下不存在完整分配方案, 无法发布",
                     "unassigned": result["unassigned"],
                     "diagnostics": result["diagnostics"],
+                    "lock_problems": result["lock_problems"],
                 },
             )
         conn.execute(

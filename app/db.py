@@ -24,6 +24,10 @@
   发起时冻结原评语内容/收据供会务方追溯, 并令该稿当前序号的反馈快照访问码立即失效);
   评审人提交的首份有效更正生成新收据并更新该槽位评语 (state: pending -> completed),
   相同内容重试幂等返回更正收据, 内容不同冲突; 发布序号变化后待更正请求自然失效;
+- assignment_locks 表保存会务方提交的普通分配锁定表 (按论文锁定 0~2 名评审人;
+  整体替换写入, 空表即清除全部锁定; 相同锁定表重试幂等, 不推进修订号);
+  锁定仅约束普通分配 (预演/发布必须保留锁定槽位, 无法兑现的锁定不被悄悄释放),
+  不改变补位的确认槽位规则;
 - 发布 = 在同一个写事务内 "校验修订号 -> 重算 -> 写入",
   因此与资料修改并发时不会产生基于旧版资料的方案。
 """
@@ -167,6 +171,19 @@ CREATE TABLE IF NOT EXISTS review_corrections (
     requested_at         TEXT NOT NULL,
     corrected_at         TEXT
 );
+-- 会务方维护的普通分配锁定表 (每篇论文锁定 0~2 名评审人)。
+-- 会务方按"完整锁定表"整体提交: 有效变更整体替换并推进资料修订号,
+-- 空表表示清除全部锁定, 相同锁定表重试幂等 (不写行、不推进修订号)。
+-- 锁定仅约束普通分配 (预演/发布必须保留锁定槽位; 锁定人随后被删除/停用/回避
+-- 或因资料与机构归并而失格时, 不悄悄释放锁定, 预演说明冲突且发布拒绝),
+-- 不改变补位的确认槽位规则; 已删除论文的锁定行保留供会务方查看/清除。
+CREATE TABLE IF NOT EXISTS assignment_locks (
+    paper_id    TEXT NOT NULL,
+    reviewer_id TEXT NOT NULL,
+    revision    INTEGER NOT NULL,   -- 本次锁定写入时推进后的资料修订号
+    locked_at   TEXT NOT NULL,
+    PRIMARY KEY (paper_id, reviewer_id)
+);
 """
 
 
@@ -275,6 +292,18 @@ def current_institution_names(conn: sqlite3.Connection):
             if name:
                 names.add(name)
     return names
+
+
+# ------------------------------------------------------------ 普通分配锁定表
+
+def get_assignment_locks(conn: sqlite3.Connection):
+    """当前普通分配锁定表 {paper_id: [reviewer_id, ...]} (论文与评审人均按编号升序)。"""
+    out: dict[str, list[str]] = {}
+    for r in conn.execute(
+        "SELECT paper_id, reviewer_id FROM assignment_locks ORDER BY paper_id, reviewer_id"
+    ).fetchall():
+        out.setdefault(r["paper_id"], []).append(r["reviewer_id"])
+    return out
 
 
 @contextmanager
